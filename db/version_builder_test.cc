@@ -41,7 +41,7 @@ class VersionBuilderTest : public testing::Test {
   ~VersionBuilderTest() override {
     for (int i = 0; i < vstorage_.num_levels(); i++) {
       for (auto* f : vstorage_.LevelFiles(i)) {
-        if (--f->refs == 0) {
+        if (f->Unref()) {
           delete f;
         }
       }
@@ -67,7 +67,6 @@ class VersionBuilderTest : public testing::Test {
     f->fd.smallest_seqno = smallest_seqno;
     f->fd.largest_seqno = largest_seqno;
     f->compensated_file_size = file_size;
-    f->refs = 0;
     f->num_entries = num_entries;
     f->num_deletions = num_deletions;
     vstorage_.AddFile(level, f);
@@ -88,10 +87,30 @@ class VersionBuilderTest : public testing::Test {
   }
 };
 
+// Check that one file number is mapped to one unique FileMetaData in a series
+// of versions.
+struct FileReferenceChecker {
+  std::unordered_map<uint64_t, FileMetaData*> files;
+
+  bool Check(const VersionStorageInfo* vstorage) {
+    for (int i = 0; i < vstorage->num_levels(); i++) {
+      for (auto* f : vstorage->LevelFiles(i)) {
+        auto it = files.find(f->fd.GetNumber());
+        if (it == files.end()) {
+          files[f->fd.GetNumber()] = f;
+        } else if (it->second != f) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+};
+
 void UnrefFilesInVersion(VersionStorageInfo* new_vstorage) {
   for (int i = 0; i < new_vstorage->num_levels(); i++) {
     for (auto* f : new_vstorage->LevelFiles(i)) {
-      if (--f->refs == 0) {
+      if (f->Unref()) {
         delete f;
       }
     }
@@ -325,45 +344,121 @@ TEST_F(VersionBuilderTest, ApplyFileDeletionNotInLSMTree) {
 TEST_F(VersionBuilderTest, ApplyFileDeletionAndAddition) {
   constexpr int level = 1;
   constexpr uint64_t file_number = 2345;
+  constexpr uint64_t path_id = 0;
+  constexpr uint64_t file_size = 1024;
   constexpr char smallest[] = "bar";
   constexpr char largest[] = "foo";
+  constexpr SequenceNumber smallest_seq = 100;
+  constexpr SequenceNumber largest_seq = 100;
+  constexpr uint64_t num_entries = 1000;
+  constexpr uint64_t num_deletions = 0;
+  constexpr bool sampled = true;
+  constexpr SequenceNumber smallest_seqno = 1;
+  constexpr SequenceNumber largest_seqno = 1000;
+  constexpr bool marked_for_compaction = false;
+  constexpr bool force_consistency_checks = false;
 
-  Add(level, file_number, smallest, largest);
+  Add(level, file_number, smallest, largest, file_size, path_id, smallest_seq,
+      largest_seq, num_entries, num_deletions, sampled, smallest_seqno,
+      largest_seqno);
 
   EnvOptions env_options;
   constexpr TableCache* table_cache = nullptr;
 
-  VersionBuilder builder(env_options, table_cache, &vstorage_);
-
   VersionEdit deletion;
-
   deletion.DeleteFile(level, file_number);
 
-  ASSERT_OK(builder.Apply(&deletion));
+  {
+    VersionBuilder builder(env_options, table_cache, &vstorage_);
+    ASSERT_OK(builder.Apply(&deletion));
+    VersionEdit addition;
+    addition.AddFile(level, file_number, path_id, file_size,
+                     GetInternalKey("181", smallest_seq),
+                     GetInternalKey("798", largest_seq), smallest_seqno,
+                     largest_seqno, marked_for_compaction);
+    ASSERT_OK(builder.Apply(&addition));
+    VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                    kCompactionStyleLevel, &vstorage_,
+                                    force_consistency_checks);
+    ASSERT_OK(builder.SaveTo(&new_vstorage));
+    ASSERT_EQ(new_vstorage.GetFileLocation(file_number).GetLevel(), level);
+    FileReferenceChecker checker;
+    ASSERT_TRUE(checker.Check(&vstorage_));
+    ASSERT_TRUE(checker.Check(&new_vstorage));
+    UnrefFilesInVersion(&new_vstorage);
+  }
 
-  VersionEdit addition;
+  {  // Move to a higher level.
+    VersionBuilder builder(env_options, table_cache, &vstorage_);
+    ASSERT_OK(builder.Apply(&deletion));
+    VersionEdit addition;
+    addition.AddFile(level + 1, file_number, path_id, file_size,
+                     GetInternalKey("181", smallest_seq),
+                     GetInternalKey("798", largest_seq), smallest_seqno,
+                     largest_seqno, marked_for_compaction);
+    ASSERT_OK(builder.Apply(&addition));
+    VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                    kCompactionStyleLevel, &vstorage_,
+                                    force_consistency_checks);
+    ASSERT_OK(builder.SaveTo(&new_vstorage));
+    ASSERT_EQ(new_vstorage.GetFileLocation(file_number).GetLevel(), level + 1);
+    // File movement should not change key estimation.
+    ASSERT_EQ(vstorage_.GetEstimatedActiveKeys(),
+              new_vstorage.GetEstimatedActiveKeys());
+    FileReferenceChecker checker;
+    ASSERT_TRUE(checker.Check(&vstorage_));
+    ASSERT_TRUE(checker.Check(&new_vstorage));
+    UnrefFilesInVersion(&new_vstorage);
+  }
 
-  constexpr uint32_t path_id = 0;
-  constexpr uint64_t file_size = 10000;
-  constexpr SequenceNumber smallest_seqno = 100;
-  constexpr SequenceNumber largest_seqno = 1000;
-  constexpr bool marked_for_compaction = false;
+  {  // Move to a different path.
+    VersionBuilder builder(env_options, table_cache, &vstorage_);
+    ASSERT_OK(builder.Apply(&deletion));
+    VersionEdit addition;
+    addition.AddFile(level, file_number, path_id + 1, file_size,
+                     GetInternalKey("181", smallest_seq),
+                     GetInternalKey("798", largest_seq), smallest_seqno,
+                     largest_seqno, marked_for_compaction);
+    const Status s = builder.Apply(&addition);
+    ASSERT_TRUE(s.IsCorruption());
+    ASSERT_TRUE(
+        std::strstr(s.getState(),
+                    "Cannot add table file #2345 to level 1 by trivial "
+                    "move since it isn't trivial to move to a different "
+                    "path"));
+  }
 
-  addition.AddFile(level, file_number, path_id, file_size,
-                   GetInternalKey(smallest), GetInternalKey(largest),
-                   smallest_seqno, largest_seqno, marked_for_compaction);
-
-  ASSERT_OK(builder.Apply(&addition));
-
-  constexpr bool force_consistency_checks = false;
-  VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
-                                  kCompactionStyleLevel, &vstorage_,
-                                  force_consistency_checks);
-
-  ASSERT_OK(builder.SaveTo(&new_vstorage));
-  ASSERT_EQ(new_vstorage.GetFileLocation(file_number).GetLevel(), level);
-
-  UnrefFilesInVersion(&new_vstorage);
+  {  // Move twice.
+    VersionBuilder builder(env_options, table_cache, &vstorage_);
+    ASSERT_OK(builder.Apply(&deletion));
+    VersionEdit addition_1;
+    addition_1.AddFile(level + 1, file_number, path_id, file_size,
+                       GetInternalKey("181", smallest_seq),
+                       GetInternalKey("798", largest_seq), smallest_seqno,
+                       largest_seqno, marked_for_compaction);
+    VersionEdit deletion_1;
+    deletion_1.DeleteFile(level + 1, file_number);
+    VersionEdit addition_2;
+    addition_2.AddFile(level + 2, file_number, path_id, file_size,
+                       GetInternalKey("181", smallest_seq),
+                       GetInternalKey("798", largest_seq), smallest_seqno,
+                       largest_seqno, marked_for_compaction);
+    ASSERT_OK(builder.Apply(&addition_1));
+    ASSERT_OK(builder.Apply(&deletion_1));
+    ASSERT_OK(builder.Apply(&addition_2));
+    VersionStorageInfo new_vstorage(&icmp_, ucmp_, options_.num_levels,
+                                    kCompactionStyleLevel, &vstorage_,
+                                    force_consistency_checks);
+    ASSERT_OK(builder.SaveTo(&new_vstorage));
+    ASSERT_EQ(new_vstorage.GetFileLocation(file_number).GetLevel(), level + 2);
+    // File movement should not change key estimation.
+    ASSERT_EQ(vstorage_.GetEstimatedActiveKeys(),
+              new_vstorage.GetEstimatedActiveKeys());
+    FileReferenceChecker checker;
+    ASSERT_TRUE(checker.Check(&vstorage_));
+    ASSERT_TRUE(checker.Check(&new_vstorage));
+    UnrefFilesInVersion(&new_vstorage);
+  }
 }
 
 TEST_F(VersionBuilderTest, ApplyFileAdditionAlreadyInBase) {
@@ -388,6 +483,7 @@ TEST_F(VersionBuilderTest, ApplyFileAdditionAlreadyInBase) {
   constexpr SequenceNumber largest_seqno = 1000;
   constexpr bool marked_for_compaction = false;
 
+  // Add an existing file.
   edit.AddFile(new_level, file_number, path_id, file_size,
                GetInternalKey(smallest), GetInternalKey(largest),
                smallest_seqno, largest_seqno, marked_for_compaction);

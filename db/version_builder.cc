@@ -78,8 +78,13 @@ class VersionBuilder::Rep {
   };
 
   struct LevelState {
-    std::unordered_set<uint64_t> deleted_files;
-    // Map from file number to file meta data.
+    // Files in base version that should be deleted.
+    std::unordered_set<uint64_t> deleted_base_files;
+    // Files moved from base version.
+    // Those files will not be referenced by VersionBuilder.
+    std::unordered_map<uint64_t, FileMetaData*> moved_files;
+    // Files added, must not intersect with moved_files.
+    // Those files will be referenced during the lifetime of VersionBuilder.
     std::unordered_map<uint64_t, FileMetaData*> added_files;
   };
 
@@ -130,8 +135,7 @@ class VersionBuilder::Rep {
   }
 
   void UnrefFile(FileMetaData* f) {
-    f->refs--;
-    if (f->refs <= 0) {
+    if (f->Unref()) {
       if (f->table_reader_handle) {
         assert(table_cache_ != nullptr);
         table_cache_->ReleaseHandle(f->table_reader_handle);
@@ -296,7 +300,13 @@ class VersionBuilder::Rep {
       add_files.erase(add_it);
     }
 
-    auto& del_files = level_state.deleted_files;
+    auto& moved_files = level_state.moved_files;
+    auto moved_it = moved_files.find(file_number);
+    if (moved_it != moved_files.end()) {
+      moved_files.erase(moved_it);
+    }
+
+    auto& del_files = level_state.deleted_base_files;
     assert(del_files.find(file_number) == del_files.end());
     del_files.emplace(file_number);
 
@@ -333,19 +343,30 @@ class VersionBuilder::Rep {
     }
 
     auto& level_state = levels_[level];
-
-    auto& del_files = level_state.deleted_files;
-    auto del_it = del_files.find(file_number);
-    if (del_it != del_files.end()) {
-      del_files.erase(del_it);
+    // Try to reuse file meta from base version.
+    FileMetaData* f = base_vstorage_->GetFileMetaDataByNumber(file_number);
+    std::unordered_map<uint64_t, FileMetaData*>* container = nullptr;
+    if (f != nullptr) {
+      // This should be a file trivially moved to a new position. Make sure the
+      // two are the same physical file.
+      if (f->fd.GetPathId() != meta.fd.GetPathId()) {
+        std::ostringstream oss;
+        oss << "Cannot add table file #" << file_number << " to level " << level
+            << " by trivial move since it isn't trivial to move to a "
+            << "different path";
+        return Status::Corruption("VersionBuilder", oss.str());
+      }
+      // No need to Ref() this file held by base_vstorage_.
+      container = &level_state.moved_files;
+    } else {
+      f = new FileMetaData(meta);
+      // Will drop reference in dtor.
+      f->Ref();
+      container = &level_state.added_files;
     }
 
-    FileMetaData* const f = new FileMetaData(meta);
-    f->refs = 1;
-
-    auto& add_files = level_state.added_files;
-    assert(add_files.find(file_number) == add_files.end());
-    add_files.emplace(file_number, f);
+    assert(container && container->find(file_number) == container->end());
+    container->emplace(file_number, f);
 
     table_file_levels_[file_number] = level;
 
@@ -403,39 +424,70 @@ class VersionBuilder::Rep {
       // Merge the set of added files with the set of pre-existing files.
       // Drop any deleted files.  Store the result in *v.
       const auto& base_files = base_vstorage_->LevelFiles(level);
+      const auto& del_files = levels_[level].deleted_base_files;
       const auto& unordered_added_files = levels_[level].added_files;
+      const auto& unordered_moved_files = levels_[level].moved_files;
+
       vstorage->Reserve(level,
                         base_files.size() + unordered_added_files.size());
 
-      // Sort added files for the level.
-      std::vector<FileMetaData*> added_files;
-      added_files.reserve(unordered_added_files.size());
+      // Sort delta files for the level.
+      std::vector<FileMetaData*> delta_files;
+      delta_files.reserve(unordered_added_files.size() +
+                          unordered_moved_files.size());
       for (const auto& pair : unordered_added_files) {
-        added_files.push_back(pair.second);
+        delta_files.push_back(pair.second);
       }
-      std::sort(added_files.begin(), added_files.end(), cmp);
+      for (const auto& pair : unordered_moved_files) {
+        // SaveTo will always be called under db mutex.
+        pair.second->being_moved_to = level;
+        delta_files.push_back(pair.second);
+      }
+      std::sort(delta_files.begin(), delta_files.end(), cmp);
 
 #ifndef NDEBUG
-      FileMetaData* prev_added_file = nullptr;
-      for (const auto& added : added_files) {
-        if (level > 0 && prev_added_file != nullptr) {
+      FileMetaData* prev_file = nullptr;
+      for (const auto& delta : delta_files) {
+        if (level > 0 && prev_file != nullptr) {
           assert(base_vstorage_->InternalComparator()->Compare(
-                     prev_added_file->smallest, added->smallest) <= 0);
+                     prev_file->smallest, delta->smallest) <= 0);
         }
-        prev_added_file = added;
+        prev_file = delta;
       }
 #endif
 
       auto base_iter = base_files.begin();
       auto base_end = base_files.end();
-      auto added_iter = added_files.begin();
-      auto added_end = added_files.end();
-      while (added_iter != added_end || base_iter != base_end) {
-        if (base_iter == base_end ||
-                (added_iter != added_end && cmp(*added_iter, *base_iter))) {
-          MaybeAddFile(vstorage, level, *added_iter++);
+      auto delta_iter = delta_files.begin();
+      auto delta_end = delta_files.end();
+
+      // Delta file supersedes base file because base is masked by
+      // deleted_base_files.
+      while (delta_iter != delta_end || base_iter != base_end) {
+        if (delta_iter == delta_end ||
+            (base_iter != base_end && cmp(*base_iter, *delta_iter))) {
+          FileMetaData* f = *base_iter++;
+          const uint64_t file_number = f->fd.GetNumber();
+
+          if (del_files.find(file_number) != del_files.end()) {
+            // vstorage inherited base_vstorage_'s stats, need to account for
+            // deleted base files.
+            vstorage->RemoveCurrentStats(f);
+          } else {
+#ifndef NDEBUG
+            assert(unordered_added_files.find(file_number) ==
+                   unordered_added_files.end());
+#endif
+            vstorage->AddFile(level, f, info_log_);
+          }
         } else {
-          MaybeAddFile(vstorage, level, *base_iter++);
+          FileMetaData* f = *delta_iter++;
+          if (f->init_stats_from_file) {
+            // A moved file whose stats is inited by base_vstorage_ and then
+            // deleted from it.
+            vstorage->UpdateAccumulatedStats(f);
+          }
+          vstorage->AddFile(level, f, info_log_);
         }
       }
     }
@@ -540,31 +592,6 @@ class VersionBuilder::Rep {
     }
     return Status::OK();
   }
-
-  void MaybeAddFile(VersionStorageInfo* vstorage, int level, FileMetaData* f) {
-    const uint64_t file_number = f->fd.GetNumber();
-
-    const auto& level_state = levels_[level];
-
-    const auto& del_files = level_state.deleted_files;
-    const auto del_it = del_files.find(file_number);
-
-    if (del_it != del_files.end()) {
-      // f is to-be-deleted table file
-      vstorage->RemoveCurrentStats(f);
-    } else {
-      const auto& add_files = level_state.added_files;
-      const auto add_it = add_files.find(file_number);
-
-      // Note: if the file appears both in the base version and in the added
-      // list, the added FileMetaData supersedes the one in the base version.
-      if (add_it != add_files.end() && add_it->second != f) {
-        vstorage->RemoveCurrentStats(f);
-      } else {
-        vstorage->AddFile(level, f, info_log_);
-      }
-    }
-  }
 };
 
 VersionBuilder::VersionBuilder(const EnvOptions& env_options,
@@ -597,10 +624,4 @@ Status VersionBuilder::LoadTableHandlers(
                                  prefetch_index_and_filter_in_cache,
                                  is_initial_load, prefix_extractor);
 }
-
-void VersionBuilder::MaybeAddFile(VersionStorageInfo* vstorage, int level,
-                                  FileMetaData* f) {
-  rep_->MaybeAddFile(vstorage, level, f);
-}
-
 }  // namespace rocksdb
