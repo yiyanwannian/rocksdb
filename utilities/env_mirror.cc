@@ -28,6 +28,7 @@ class SequentialFileMirror : public SequentialFile {
       char* bscratch = new char[n];
       Slice bslice;
       size_t off = 0;
+      printf("%zu", off);
       size_t left = aslice.size();
       while (left) {
         Status bs = b_->Read(left, &bslice, bscratch);
