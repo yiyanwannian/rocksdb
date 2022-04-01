@@ -110,6 +110,7 @@ Status DBImpl::MultiBatchWriteImpl(const WriteOptions& write_options,
     size_t total_count = 0;
     size_t total_byte_size = 0;
     size_t valid_batches = 0;
+    printf("%zu", valid_batches);
     auto stats = default_cf_internal_stats_;
     if (writer.status.ok()) {
       SequenceNumber next_sequence = current_sequence;
